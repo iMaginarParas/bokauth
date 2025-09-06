@@ -21,7 +21,7 @@ PORT = int(os.getenv("PORT", 8000))
 
 # CORS configuration based on environment
 if ENVIRONMENT == "production":
-    allowed_origins = [FRONTEND_URL]
+    allowed_origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 else:
     allowed_origins = ["*"]  # Allow all origins in development
 
@@ -43,8 +43,18 @@ if not SUPABASE_URL:
 if not SUPABASE_ANON_KEY:
     raise ValueError("SUPABASE_ANON_KEY environment variable is required")
 
-# Create Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+# Create Supabase client with proper error handling
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+except Exception as e:
+    print(f"Failed to create Supabase client: {e}")
+    # Try with additional options for newer versions
+    try:
+        from supabase.lib.client_options import ClientOptions
+        options = ClientOptions()
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options)
+    except Exception as e2:
+        raise ValueError(f"Could not initialize Supabase client: {e2}")
 
 # Security
 security = HTTPBearer()
@@ -134,7 +144,7 @@ async def sign_up(request: SignUpRequest):
             )
     except Exception as e:
         error_msg = str(e)
-        if "User already registered" in error_msg:
+        if "User already registered" in error_msg or "already registered" in error_msg:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="User already exists with this email"
@@ -215,12 +225,12 @@ async def sign_in(request: SignInRequest):
             )
     except Exception as e:
         error_msg = str(e)
-        if "Invalid login credentials" in error_msg:
+        if "Invalid login credentials" in error_msg or "invalid" in error_msg.lower():
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
-        elif "Email not confirmed" in error_msg:
+        elif "Email not confirmed" in error_msg or "not confirmed" in error_msg:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Please verify your email before signing in"
@@ -230,17 +240,32 @@ async def sign_in(request: SignInRequest):
             detail=f"Login failed: {error_msg}"
         )
 
+@app.get("/auth/google/url")
+async def get_google_oauth_url():
+    """Get Google OAuth URL for frontend"""
+    try:
+        response = supabase.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": f"{FRONTEND_URL}/auth/callback"
+            }
+        })
+        
+        return {"url": response.url}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to generate Google OAuth URL: {str(e)}"
+        )
+
 @app.post("/auth/google", response_model=AuthResponse)
 async def google_auth(request: GoogleAuthRequest):
     """Sign in with Google OAuth"""
     try:
-        # Note: This requires the Google access token from the frontend
-        # The frontend should handle Google OAuth and send the access token
+        # This method varies by Supabase version
+        # For newer versions, you might need to handle this differently
         response = supabase.auth.sign_in_with_oauth({
-            "provider": "google",
-            "options": {
-                "access_token": request.access_token
-            }
+            "provider": "google"
         })
         
         if response.user and response.session:
@@ -261,24 +286,6 @@ async def google_auth(request: GoogleAuthRequest):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Google authentication failed: {str(e)}"
-        )
-
-@app.get("/auth/google/url")
-async def get_google_oauth_url():
-    """Get Google OAuth URL for frontend"""
-    try:
-        response = supabase.auth.sign_in_with_oauth({
-            "provider": "google",
-            "options": {
-                "redirect_to": f"{FRONTEND_URL}/auth/callback"
-            }
-        })
-        
-        return {"url": response.url}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to generate Google OAuth URL: {str(e)}"
         )
 
 @app.post("/auth/refresh")
