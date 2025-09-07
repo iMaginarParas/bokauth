@@ -98,29 +98,25 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 async def send_otp(request: EmailOTPRequest):
     """Send 6-digit OTP code to email for authentication"""
     try:
-        # Method 1: Try signup which sends actual OTP codes
-        try:
-            response = supabase.auth.sign_up({
-                "email": request.email,
-                "password": "temporary_password_123"  # Required but won't be used
-            })
-            return {
-                "message": "6-digit OTP code sent to your email. Check your inbox!",
-                "email": request.email
+        # Use sign_in_with_otp but specify we want OTP, not magic link
+        response = supabase.auth.sign_in_with_otp({
+            "email": request.email,
+            "options": {
+                "should_create_user": True,
+                "data": {}
             }
-        except Exception as signup_error:
-            # If user already exists, try password reset which also sends OTP
-            if "already registered" in str(signup_error) or "User already registered" in str(signup_error):
-                response = supabase.auth.reset_password_email(request.email)
-                return {
-                    "message": "6-digit OTP code sent to your email. Check your inbox!",
-                    "email": request.email
-                }
-            else:
-                raise signup_error
+        })
+        
+        print(f"OTP response: {response}")  # Debug log
+        return {
+            "message": "6-digit OTP code sent to your email. Check your inbox!",
+            "email": request.email,
+            "debug": "Used sign_in_with_otp method"
+        }
                 
     except Exception as e:
         error_msg = str(e)
+        print(f"Send OTP error: {error_msg}")  # Debug log
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to send OTP: {error_msg}"
