@@ -98,35 +98,50 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 async def send_otp(request: EmailOTPRequest):
     """Send 6-digit OTP code to email for authentication"""
     try:
-        # Use sign_in_with_otp but specify we want OTP, not magic link
-        response = supabase.auth.sign_in_with_otp({
+        # For email OTP, we need to use sign_up first to create user
+        # This sends a proper OTP code for email verification
+        response = supabase.auth.sign_up({
             "email": request.email,
-            "options": {
-                "should_create_user": True,
-                "data": {}
-            }
+            "password": "temp_password_123!"  # Required but not used for OTP flow
         })
         
-        print(f"OTP response: {response}")  # Debug log
+        print(f"Signup OTP response: {response}")  # Debug log
         return {
-            "message": "6-digit OTP code sent to your email. Check your inbox!",
+            "message": "6-digit OTP code sent to your email for verification!",
             "email": request.email,
-            "debug": "Used sign_in_with_otp method"
+            "debug": "Used signup method for OTP"
         }
                 
     except Exception as e:
         error_msg = str(e)
         print(f"Send OTP error: {error_msg}")  # Debug log
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to send OTP: {error_msg}"
-        )
+        
+        # If user already exists, that's actually fine for our use case
+        if "already registered" in error_msg or "User already registered" in error_msg:
+            # User exists, send them a password reset OTP instead
+            try:
+                response = supabase.auth.reset_password_email(request.email)
+                return {
+                    "message": "6-digit OTP code sent to your email for verification!",
+                    "email": request.email,
+                    "debug": "Used password reset for existing user OTP"
+                }
+            except Exception as reset_error:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to send OTP: {str(reset_error)}"
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to send OTP: {error_msg}"
+            )
 
 @app.post("/auth/verify-otp", response_model=AuthResponse)
 async def verify_otp(request: VerifyOTPRequest):
     """Verify the 6-digit OTP code and authenticate user"""
     try:
-        # Try verifying as signup OTP first
+        # First try verifying as signup OTP (for new users)
         try:
             response = supabase.auth.verify_otp({
                 "email": request.email,
@@ -140,34 +155,40 @@ async def verify_otp(request: VerifyOTPRequest):
                     refresh_token=response.session.refresh_token,
                     user_id=response.user.id,
                     email=response.user.email,
-                    message="Authentication successful!"
+                    message="OTP verification successful! Welcome!"
                 )
-        except Exception:
-            # If signup OTP fails, try recovery OTP
-            response = supabase.auth.verify_otp({
-                "email": request.email,
-                "token": request.token,
-                "type": "recovery"
-            })
+        except Exception as signup_verify_error:
+            print(f"Signup verification failed: {signup_verify_error}")
             
-            if response.user and response.session:
-                return AuthResponse(
-                    access_token=response.session.access_token,
-                    refresh_token=response.session.refresh_token,
-                    user_id=response.user.id,
-                    email=response.user.email,
-                    message="Authentication successful!"
-                )
+            # If signup OTP fails, try as recovery OTP (for existing users)
+            try:
+                response = supabase.auth.verify_otp({
+                    "email": request.email,
+                    "token": request.token,
+                    "type": "recovery"
+                })
+                
+                if response.user and response.session:
+                    return AuthResponse(
+                        access_token=response.session.access_token,
+                        refresh_token=response.session.refresh_token,
+                        user_id=response.user.id,
+                        email=response.user.email,
+                        message="OTP verification successful! Welcome back!"
+                    )
+            except Exception as recovery_verify_error:
+                print(f"Recovery verification failed: {recovery_verify_error}")
         
-        # If both fail
+        # If both methods fail
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired OTP code"
+            detail="Invalid or expired OTP code. Please try again."
         )
             
     except HTTPException:
         raise
     except Exception as e:
+        print(f"OTP verification error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"OTP verification failed: {str(e)}"
@@ -177,9 +198,12 @@ async def verify_otp(request: VerifyOTPRequest):
 async def resend_otp(request: EmailOTPRequest):
     """Resend OTP code to email"""
     try:
-        # Try resending as recovery email (which sends OTP)
+        # Try sending as password reset (works for existing users)
         response = supabase.auth.reset_password_email(request.email)
-        return {"message": "New OTP code sent to your email!"}
+        return {
+            "message": "New OTP code sent to your email!",
+            "email": request.email
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -197,7 +221,10 @@ async def get_google_oauth_url():
             }
         })
         
-        return {"url": response.url}
+        return {
+            "url": response.url,
+            "message": "Redirect user to this URL for Google OAuth"
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -205,13 +232,11 @@ async def get_google_oauth_url():
         )
 
 @app.post("/auth/google/callback", response_model=AuthResponse)
-async def google_callback(request: GoogleAuthRequest):
-    """Handle Google OAuth callback with access token"""
+async def google_callback(access_token: str, refresh_token: str):
+    """Handle Google OAuth callback - frontend sends tokens after OAuth"""
     try:
-        # This method varies by Supabase version and setup
-        response = supabase.auth.sign_in_with_oauth({
-            "provider": "google"
-        })
+        # Set the session with tokens received from frontend
+        response = supabase.auth.set_session(access_token, refresh_token)
         
         if response.user and response.session:
             return AuthResponse(
@@ -224,7 +249,7 @@ async def google_callback(request: GoogleAuthRequest):
         else:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Google authentication failed"
+                detail="Invalid Google OAuth tokens"
             )
     except Exception as e:
         raise HTTPException(
@@ -283,7 +308,8 @@ async def root():
     return {
         "message": "Supabase OTP + Google Auth API is running!",
         "timestamp": datetime.now().isoformat(),
-        "environment": ENVIRONMENT
+        "environment": ENVIRONMENT,
+        "auth_methods": ["email_otp", "google_oauth"]
     }
 
 # Protected route example
