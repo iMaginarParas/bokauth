@@ -43,37 +43,23 @@ if not SUPABASE_URL:
 if not SUPABASE_ANON_KEY:
     raise ValueError("SUPABASE_ANON_KEY environment variable is required")
 
-# Create Supabase client with proper error handling
+# Create Supabase client
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 except Exception as e:
     print(f"Failed to create Supabase client: {e}")
-    # Try with additional options for newer versions
-    try:
-        from supabase.lib.client_options import ClientOptions
-        options = ClientOptions()
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options)
-    except Exception as e2:
-        raise ValueError(f"Could not initialize Supabase client: {e2}")
+    raise ValueError(f"Could not initialize Supabase client: {e}")
 
 # Security
 security = HTTPBearer()
 
 # Pydantic models
-class SignUpRequest(BaseModel):
+class EmailOTPRequest(BaseModel):
     email: EmailStr
-    password: str
-
-class SignInRequest(BaseModel):
-    email: EmailStr
-    password: str
 
 class VerifyOTPRequest(BaseModel):
     email: EmailStr
     token: str
-
-class ResendOTPRequest(BaseModel):
-    email: EmailStr
 
 class GoogleAuthRequest(BaseModel):
     access_token: str
@@ -87,14 +73,12 @@ class AuthResponse(BaseModel):
     user_id: Optional[str] = None
     email: Optional[str] = None
     message: str
-    requires_verification: bool = False
 
 # Helper functions
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Extract and validate user from JWT token"""
     token = credentials.credentials
     try:
-        # Verify the JWT token with Supabase
         response = supabase.auth.get_user(token)
         if response.user:
             return response.user
@@ -110,58 +94,34 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
 
 # Auth routes
-@app.post("/auth/signup", response_model=AuthResponse)
-async def sign_up(request: SignUpRequest):
-    """Sign up with email and password (sends OTP for verification)"""
+@app.post("/auth/send-otp")
+async def send_otp(request: EmailOTPRequest):
+    """Send OTP to email for authentication"""
     try:
-        response = supabase.auth.sign_up({
-            "email": request.email,
-            "password": request.password,
+        # Send magic link / OTP to email
+        response = supabase.auth.sign_in_with_otp({
+            "email": request.email
         })
         
-        if response.user:
-            # Check if email confirmation is required
-            if not response.user.email_confirmed_at:
-                return AuthResponse(
-                    message="Registration successful. Please check your email for verification code.",
-                    requires_verification=True,
-                    user_id=response.user.id,
-                    email=response.user.email
-                )
-            else:
-                return AuthResponse(
-                    access_token=response.session.access_token if response.session else None,
-                    refresh_token=response.session.refresh_token if response.session else None,
-                    user_id=response.user.id,
-                    email=response.user.email,
-                    message="Registration and login successful",
-                    requires_verification=False
-                )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Registration failed"
-            )
+        return {
+            "message": "OTP sent successfully. Please check your email.",
+            "email": request.email
+        }
     except Exception as e:
         error_msg = str(e)
-        if "User already registered" in error_msg or "already registered" in error_msg:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="User already exists with this email"
-            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Registration failed: {error_msg}"
+            detail=f"Failed to send OTP: {error_msg}"
         )
 
 @app.post("/auth/verify-otp", response_model=AuthResponse)
 async def verify_otp(request: VerifyOTPRequest):
-    """Verify email with OTP code"""
+    """Verify email with OTP code and sign in"""
     try:
         response = supabase.auth.verify_otp({
             "email": request.email,
             "token": request.token,
-            "type": "signup"
+            "type": "email"
         })
         
         if response.user and response.session:
@@ -170,79 +130,38 @@ async def verify_otp(request: VerifyOTPRequest):
                 refresh_token=response.session.refresh_token,
                 user_id=response.user.id,
                 email=response.user.email,
-                message="Email verified successfully",
-                requires_verification=False
+                message="Authentication successful"
             )
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired verification code"
+                detail="Invalid or expired OTP code"
             )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Verification failed: {str(e)}"
+            detail=f"OTP verification failed: {str(e)}"
         )
 
 @app.post("/auth/resend-otp")
-async def resend_otp(request: ResendOTPRequest):
-    """Resend OTP verification email"""
+async def resend_otp(request: EmailOTPRequest):
+    """Resend OTP to email"""
     try:
         response = supabase.auth.resend({
-            "type": "signup",
+            "type": "email",
             "email": request.email
         })
         
-        return {"message": "Verification email sent successfully"}
+        return {"message": "OTP resent successfully"}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to resend verification email: {str(e)}"
-        )
-
-@app.post("/auth/signin", response_model=AuthResponse)
-async def sign_in(request: SignInRequest):
-    """Sign in with email and password"""
-    try:
-        response = supabase.auth.sign_in_with_password({
-            "email": request.email,
-            "password": request.password
-        })
-        
-        if response.user and response.session:
-            return AuthResponse(
-                access_token=response.session.access_token,
-                refresh_token=response.session.refresh_token,
-                user_id=response.user.id,
-                email=response.user.email,
-                message="Login successful",
-                requires_verification=False
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials"
-            )
-    except Exception as e:
-        error_msg = str(e)
-        if "Invalid login credentials" in error_msg or "invalid" in error_msg.lower():
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        elif "Email not confirmed" in error_msg or "not confirmed" in error_msg:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Please verify your email before signing in"
-            )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Login failed: {error_msg}"
+            detail=f"Failed to resend OTP: {str(e)}"
         )
 
 @app.get("/auth/google/url")
 async def get_google_oauth_url():
-    """Get Google OAuth URL for frontend"""
+    """Get Google OAuth URL for frontend redirection"""
     try:
         response = supabase.auth.sign_in_with_oauth({
             "provider": "google",
@@ -258,12 +177,12 @@ async def get_google_oauth_url():
             detail=f"Failed to generate Google OAuth URL: {str(e)}"
         )
 
-@app.post("/auth/google", response_model=AuthResponse)
-async def google_auth(request: GoogleAuthRequest):
-    """Sign in with Google OAuth"""
+@app.post("/auth/google/callback", response_model=AuthResponse)
+async def google_callback(request: GoogleAuthRequest):
+    """Handle Google OAuth callback with access token"""
     try:
-        # This method varies by Supabase version
-        # For newer versions, you might need to handle this differently
+        # This handles the Google OAuth token exchange
+        # Frontend should send the Google access token here
         response = supabase.auth.sign_in_with_oauth({
             "provider": "google"
         })
@@ -274,8 +193,7 @@ async def google_auth(request: GoogleAuthRequest):
                 refresh_token=response.session.refresh_token,
                 user_id=response.user.id,
                 email=response.user.email,
-                message="Google login successful",
-                requires_verification=False
+                message="Google authentication successful"
             )
         else:
             raise HTTPException(
@@ -290,7 +208,7 @@ async def google_auth(request: GoogleAuthRequest):
 
 @app.post("/auth/refresh")
 async def refresh_token(request: RefreshTokenRequest):
-    """Refresh access token"""
+    """Refresh access token using refresh token"""
     try:
         response = supabase.auth.refresh_session(request.refresh_token)
         
@@ -329,7 +247,6 @@ async def get_user_profile(current_user = Depends(get_current_user)):
     return {
         "user_id": current_user.id,
         "email": current_user.email,
-        "email_confirmed": current_user.email_confirmed_at is not None,
         "created_at": current_user.created_at,
         "last_sign_in": current_user.last_sign_in_at
     }
