@@ -74,6 +74,13 @@ class AuthResponse(BaseModel):
     email: Optional[str] = None
     message: str
 
+class TokenResponse(BaseModel):
+    user_id: str
+    jwt_token: str
+    email: str
+    expires_at: Optional[int] = None
+    message: str
+
 # Helper functions
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Extract and validate user from JWT token"""
@@ -82,6 +89,24 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         response = supabase.auth.get_user(token)
         if response.user:
             return response.user
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+def get_current_user_with_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Extract user and return both user object and the JWT token"""
+    token = credentials.credentials
+    try:
+        response = supabase.auth.get_user(token)
+        if response.user:
+            return response.user, token
         else:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -260,6 +285,19 @@ async def get_user_profile(current_user = Depends(get_current_user)):
         "created_at": current_user.created_at,
         "last_sign_in": current_user.last_sign_in_at
     }
+
+# NEW ENDPOINT: Get UID and JWT Token for database operations
+@app.get("/auth/token", response_model=TokenResponse)
+async def get_user_token(user_and_token = Depends(get_current_user_with_token)):
+    """Get user ID and JWT token for database operations"""
+    user, jwt_token = user_and_token
+    
+    return TokenResponse(
+        user_id=user.id,
+        jwt_token=jwt_token,
+        email=user.email,
+        message="Token and UID retrieved successfully"
+    )
 
 @app.get("/")
 async def root():
