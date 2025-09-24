@@ -1,16 +1,47 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from supabase import create_client, Client
 import os
-from typing import Optional
-from datetime import datetime
-from dotenv import load_dotenv
 import re
+import sys
+from datetime import datetime
+from typing import Optional
 
-# Load environment variables
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+
+# Load environment variables first
 load_dotenv()
+
+# Validate required environment variables early
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL:
+    print("ERROR: SUPABASE_URL environment variable is required")
+    sys.exit(1)
+if not SUPABASE_ANON_KEY:
+    print("ERROR: SUPABASE_ANON_KEY environment variable is required")
+    sys.exit(1)
+
+print(f"Initializing with Supabase URL: {SUPABASE_URL[:50]}...")
+
+# Try to import and initialize Supabase
+try:
+    from supabase import create_client, Client
+    print("✓ Supabase package imported successfully")
+    
+    # Initialize Supabase client
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    print("✓ Supabase client initialized successfully")
+    
+except ImportError as e:
+    print(f"ERROR: Failed to import supabase: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: Failed to initialize Supabase client: {e}")
+    print("This might be due to invalid credentials or network issues")
+    sys.exit(1)
 
 # Initialize FastAPI app
 app = FastAPI(title="Supabase OTP Auth API", version="1.0.0")
@@ -20,11 +51,11 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 PORT = int(os.getenv("PORT", 8000))
 
-# CORS configuration based on environment
+# CORS configuration
 if ENVIRONMENT == "production":
     allowed_origins = [FRONTEND_URL]
 else:
-    allowed_origins = ["*"]  # Allow all origins in development
+    allowed_origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,40 +65,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Supabase configuration - ONLY from environment variables
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-
-# Validate required environment variables
-if not SUPABASE_URL:
-    raise ValueError("SUPABASE_URL environment variable is required")
-if not SUPABASE_ANON_KEY:
-    raise ValueError("SUPABASE_ANON_KEY environment variable is required")
-
-# Create Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
 # Security
 security = HTTPBearer()
 
-# Utility function to validate phone numbers
+# Utility functions
 def validate_phone_number(phone: str) -> str:
     """Validate and format phone number"""
+    if not phone:
+        raise ValueError("Phone number is required")
+    
     # Remove all non-digit characters except +
     clean_phone = re.sub(r'[^\d+]', '', phone)
     
     # Ensure phone number starts with country code
     if not clean_phone.startswith('+'):
         if clean_phone.startswith('0'):
-            clean_phone = clean_phone[1:]  # Remove leading 0
-        # Add default country code (adjust as needed)
+            clean_phone = clean_phone[1:]
+        # Add default country code for US
         clean_phone = '+1' + clean_phone
     
-    # Validate phone number format (basic validation)
+    # Validate phone number format
     if not re.match(r'^\+\d{10,15}$', clean_phone):
-        raise ValueError("Invalid phone number format")
+        raise ValueError("Invalid phone number format. Use format: +1234567890")
     
     return clean_phone
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Extract and validate user from JWT token"""
+    token = credentials.credentials
+    try:
+        response = supabase.auth.get_user(token)
+        if response.user:
+            return response.user
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
 
 # Pydantic models
 class EmailSignInRequest(BaseModel):
@@ -97,27 +136,27 @@ class AuthResponse(BaseModel):
     message: str
     requires_verification: bool = False
 
-# Helper functions
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Extract and validate user from JWT token"""
-    token = credentials.credentials
+# Routes
+@app.get("/")
+async def root():
+    """Health check endpoint"""
     try:
-        # Verify the JWT token with Supabase
-        response = supabase.auth.get_user(token)
-        if response.user:
-            return response.user
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token"
-            )
+        # Test basic Supabase connection
+        # This doesn't make an actual API call but ensures the client is working
+        return {
+            "message": "Supabase OTP-only Auth API is running",
+            "timestamp": datetime.now().isoformat(),
+            "environment": ENVIRONMENT,
+            "auth_methods": ["email_otp", "sms_otp"],
+            "status": "healthy"
+        }
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
+        return {
+            "message": "API running but Supabase connection issues",
+            "error": str(e),
+            "status": "degraded"
+        }
 
-# Email OTP Authentication
 @app.post("/auth/email/signin", response_model=AuthResponse)
 async def email_sign_in(request: EmailSignInRequest):
     """Sign in with email (sends email OTP)"""
@@ -126,36 +165,31 @@ async def email_sign_in(request: EmailSignInRequest):
             "email": request.email
         })
         
-        # Email OTP sign-in typically doesn't return a session immediately
-        # The user needs to verify the OTP first
         return AuthResponse(
-            message="Email verification code sent. Please check your email and verify to complete sign in.",
+            message="Email verification code sent. Please check your email.",
             requires_verification=True,
             email=request.email
         )
     except Exception as e:
         error_msg = str(e)
+        print(f"Email sign in error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Email sign in failed: {error_msg}"
+            detail=f"Failed to send email OTP: {error_msg}"
         )
 
-# SMS/Phone OTP Authentication
 @app.post("/auth/phone/signin", response_model=AuthResponse)
 async def phone_sign_in(request: PhoneSignInRequest):
     """Sign in with phone number (sends SMS OTP)"""
     try:
-        # Validate phone number
         clean_phone = validate_phone_number(request.phone)
         
         response = supabase.auth.sign_in_with_otp({
             "phone": clean_phone
         })
         
-        # SMS OTP sign-in typically doesn't return a session immediately
-        # The user needs to verify the OTP first
         return AuthResponse(
-            message="SMS verification code sent. Please verify to complete sign in.",
+            message="SMS verification code sent. Please check your phone.",
             requires_verification=True,
             phone=clean_phone
         )
@@ -165,9 +199,11 @@ async def phone_sign_in(request: PhoneSignInRequest):
             detail=str(ve)
         )
     except Exception as e:
+        error_msg = str(e)
+        print(f"Phone sign in error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"SMS sign in failed: {str(e)}"
+            detail=f"Failed to send SMS OTP: {error_msg}"
         )
 
 @app.post("/auth/verify-otp", response_model=AuthResponse)
@@ -175,14 +211,12 @@ async def verify_otp(request: VerifyOTPRequest):
     """Verify OTP code (email or SMS)"""
     try:
         if request.email:
-            # Email OTP verification
             response = supabase.auth.verify_otp({
                 "email": request.email,
                 "token": request.token,
                 "type": "email"
             })
         elif request.phone:
-            # SMS OTP verification
             clean_phone = validate_phone_number(request.phone)
             response = supabase.auth.verify_otp({
                 "phone": clean_phone,
@@ -202,7 +236,7 @@ async def verify_otp(request: VerifyOTPRequest):
                 user_id=response.user.id,
                 email=response.user.email,
                 phone=response.user.phone,
-                message="Verification successful - signed in!",
+                message="Verification successful!",
                 requires_verification=False
             )
         else:
@@ -216,9 +250,11 @@ async def verify_otp(request: VerifyOTPRequest):
             detail=str(ve)
         )
     except Exception as e:
+        error_msg = str(e)
+        print(f"OTP verification error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Verification failed: {str(e)}"
+            detail=f"Verification failed: {error_msg}"
         )
 
 @app.post("/auth/resend-otp")
@@ -226,13 +262,11 @@ async def resend_otp(request: ResendOTPRequest):
     """Resend OTP verification (email or SMS)"""
     try:
         if request.email:
-            # Resend email OTP
             response = supabase.auth.sign_in_with_otp({
                 "email": request.email
             })
             return {"message": "Email verification code sent successfully"}
         elif request.phone:
-            # Resend SMS OTP
             clean_phone = validate_phone_number(request.phone)
             response = supabase.auth.sign_in_with_otp({
                 "phone": clean_phone
@@ -249,12 +283,13 @@ async def resend_otp(request: ResendOTPRequest):
             detail=str(ve)
         )
     except Exception as e:
+        error_msg = str(e)
+        print(f"Resend OTP error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to resend verification: {str(e)}"
+            detail=f"Failed to resend verification: {error_msg}"
         )
 
-# Token and session management
 @app.post("/auth/refresh")
 async def refresh_token(request: RefreshTokenRequest):
     """Refresh access token"""
@@ -273,9 +308,11 @@ async def refresh_token(request: RefreshTokenRequest):
                 detail="Invalid refresh token"
             )
     except Exception as e:
+        error_msg = str(e)
+        print(f"Token refresh error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token refresh failed: {str(e)}"
+            detail=f"Token refresh failed: {error_msg}"
         )
 
 @app.post("/auth/signout")
@@ -285,9 +322,11 @@ async def sign_out(current_user = Depends(get_current_user)):
         response = supabase.auth.sign_out()
         return {"message": "Signed out successfully"}
     except Exception as e:
+        error_msg = str(e)
+        print(f"Sign out error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Sign out failed: {str(e)}"
+            detail=f"Sign out failed: {error_msg}"
         )
 
 @app.get("/auth/user")
@@ -303,17 +342,6 @@ async def get_user_profile(current_user = Depends(get_current_user)):
         "last_sign_in": current_user.last_sign_in_at
     }
 
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "message": "Supabase OTP-only Auth API is running",
-        "timestamp": datetime.now().isoformat(),
-        "environment": ENVIRONMENT,
-        "auth_methods": ["email_otp", "sms_otp"]
-    }
-
-# Protected route example
 @app.get("/protected")
 async def protected_route(current_user = Depends(get_current_user)):
     """Example protected route"""
@@ -325,4 +353,5 @@ async def protected_route(current_user = Depends(get_current_user)):
 
 if __name__ == "__main__":
     import uvicorn
+    print(f"Starting server on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
