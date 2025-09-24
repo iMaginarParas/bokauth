@@ -1,0 +1,16 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[env]
+# These will be set in Railway dashboard - DO NOT put actual values here
+SUPABASE_URL = "${{SUPABASE_URL}}"
+SUPABASE_ANON_KEY = "${{SUPABASE_ANON_KEY}}"
+FRONTEND_URL = "${{FRONTEND_URL}}"
+ENVIRONMENT = "${{ENVIRONMENT}}"
+PORT = "${{PORT}}"

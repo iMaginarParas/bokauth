@@ -7,13 +7,12 @@ import os
 from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
-import re
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="Supabase OTP Auth API", version="1.0.0")
+app = FastAPI(title="Supabase Auth API", version="1.0.0")
 
 # Environment configuration
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
@@ -22,7 +21,7 @@ PORT = int(os.getenv("PORT", 8000))
 
 # CORS configuration based on environment
 if ENVIRONMENT == "production":
-    allowed_origins = [FRONTEND_URL]
+    allowed_origins = [FRONTEND_URL] if FRONTEND_URL else ["*"]
 else:
     allowed_origins = ["*"]  # Allow all origins in development
 
@@ -45,45 +44,25 @@ if not SUPABASE_ANON_KEY:
     raise ValueError("SUPABASE_ANON_KEY environment variable is required")
 
 # Create Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+except Exception as e:
+    print(f"Failed to create Supabase client: {e}")
+    raise ValueError(f"Could not initialize Supabase client: {e}")
 
 # Security
 security = HTTPBearer()
 
-# Utility function to validate phone numbers
-def validate_phone_number(phone: str) -> str:
-    """Validate and format phone number"""
-    # Remove all non-digit characters except +
-    clean_phone = re.sub(r'[^\d+]', '', phone)
-    
-    # Ensure phone number starts with country code
-    if not clean_phone.startswith('+'):
-        if clean_phone.startswith('0'):
-            clean_phone = clean_phone[1:]  # Remove leading 0
-        # Add default country code (adjust as needed)
-        clean_phone = '+1' + clean_phone
-    
-    # Validate phone number format (basic validation)
-    if not re.match(r'^\+\d{10,15}$', clean_phone):
-        raise ValueError("Invalid phone number format")
-    
-    return clean_phone
-
 # Pydantic models
-class EmailSignInRequest(BaseModel):
+class EmailOTPRequest(BaseModel):
     email: EmailStr
 
-class PhoneSignInRequest(BaseModel):
-    phone: str
-
 class VerifyOTPRequest(BaseModel):
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = None
+    email: EmailStr
     token: str
 
-class ResendOTPRequest(BaseModel):
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = None
+class GoogleAuthRequest(BaseModel):
+    access_token: str
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
@@ -93,16 +72,20 @@ class AuthResponse(BaseModel):
     refresh_token: Optional[str] = None
     user_id: Optional[str] = None
     email: Optional[str] = None
-    phone: Optional[str] = None
     message: str
-    requires_verification: bool = False
+
+class TokenResponse(BaseModel):
+    user_id: str
+    jwt_token: str
+    email: str
+    expires_at: Optional[int] = None
+    message: str
 
 # Helper functions
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Extract and validate user from JWT token"""
     token = credentials.credentials
     try:
-        # Verify the JWT token with Supabase
         response = supabase.auth.get_user(token)
         if response.user:
             return response.user
@@ -117,83 +100,62 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             detail="Invalid token"
         )
 
-# Email OTP Authentication
-@app.post("/auth/email/signin", response_model=AuthResponse)
-async def email_sign_in(request: EmailSignInRequest):
-    """Sign in with email (sends email OTP)"""
+def get_current_user_with_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Extract user and return both user object and the JWT token"""
+    token = credentials.credentials
     try:
-        response = supabase.auth.sign_in_with_otp({
-            "email": request.email
-        })
-        
-        # Email OTP sign-in typically doesn't return a session immediately
-        # The user needs to verify the OTP first
-        return AuthResponse(
-            message="Email verification code sent. Please check your email and verify to complete sign in.",
-            requires_verification=True,
-            email=request.email
-        )
+        response = supabase.auth.get_user(token)
+        if response.user:
+            return response.user, token
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
     except Exception as e:
-        error_msg = str(e)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Email sign in failed: {error_msg}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
         )
 
-# SMS/Phone OTP Authentication
-@app.post("/auth/phone/signin", response_model=AuthResponse)
-async def phone_sign_in(request: PhoneSignInRequest):
-    """Sign in with phone number (sends SMS OTP)"""
+# Auth routes
+@app.post("/auth/send-otp")
+async def send_otp(request: EmailOTPRequest):
+    """Send 6-digit OTP code to email for authentication"""
     try:
-        # Validate phone number
-        clean_phone = validate_phone_number(request.phone)
-        
+        # Use sign_in_with_otp exactly as shown in Supabase docs
         response = supabase.auth.sign_in_with_otp({
-            "phone": clean_phone
+            'email': request.email,
+            'options': {
+                'should_create_user': True,  # Allow new user creation
+            },
         })
         
-        # SMS OTP sign-in typically doesn't return a session immediately
-        # The user needs to verify the OTP first
-        return AuthResponse(
-            message="SMS verification code sent. Please verify to complete sign in.",
-            requires_verification=True,
-            phone=clean_phone
-        )
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
-        )
+        print(f"OTP response: {response}")  # Debug log
+        return {
+            "message": "6-digit OTP code sent to your email. Check your inbox!",
+            "email": request.email,
+            "debug": "Used sign_in_with_otp with should_create_user=True"
+        }
+                
     except Exception as e:
+        error_msg = str(e)
+        print(f"Send OTP error: {error_msg}")  # Debug log
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"SMS sign in failed: {str(e)}"
+            detail=f"Failed to send OTP: {error_msg}"
         )
 
 @app.post("/auth/verify-otp", response_model=AuthResponse)
 async def verify_otp(request: VerifyOTPRequest):
-    """Verify OTP code (email or SMS)"""
+    """Verify the 6-digit OTP code and authenticate user"""
     try:
-        if request.email:
-            # Email OTP verification
-            response = supabase.auth.verify_otp({
-                "email": request.email,
-                "token": request.token,
-                "type": "email"
-            })
-        elif request.phone:
-            # SMS OTP verification
-            clean_phone = validate_phone_number(request.phone)
-            response = supabase.auth.verify_otp({
-                "phone": clean_phone,
-                "token": request.token,
-                "type": "sms"
-            })
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either email or phone number is required"
-            )
+        # Use type: 'email' as shown in Supabase docs
+        response = supabase.auth.verify_otp({
+            'email': request.email,
+            'token': request.token,
+            'type': 'email',  # This is the key - use 'email' not 'signup'
+        })
         
         if response.user and response.session:
             return AuthResponse(
@@ -201,63 +163,87 @@ async def verify_otp(request: VerifyOTPRequest):
                 refresh_token=response.session.refresh_token,
                 user_id=response.user.id,
                 email=response.user.email,
-                phone=response.user.phone,
-                message="Verification successful - signed in!",
-                requires_verification=False
+                message="OTP verification successful!"
             )
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired verification code"
+                detail="Invalid or expired OTP code"
             )
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
-        )
+            
     except Exception as e:
+        print(f"OTP verification error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Verification failed: {str(e)}"
+            detail=f"OTP verification failed: {str(e)}"
         )
 
 @app.post("/auth/resend-otp")
-async def resend_otp(request: ResendOTPRequest):
-    """Resend OTP verification (email or SMS)"""
+async def resend_otp(request: EmailOTPRequest):
+    """Resend OTP code to email"""
     try:
-        if request.email:
-            # Resend email OTP
-            response = supabase.auth.sign_in_with_otp({
-                "email": request.email
-            })
-            return {"message": "Email verification code sent successfully"}
-        elif request.phone:
-            # Resend SMS OTP
-            clean_phone = validate_phone_number(request.phone)
-            response = supabase.auth.sign_in_with_otp({
-                "phone": clean_phone
-            })
-            return {"message": "SMS verification code sent successfully"}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either email or phone number is required"
-            )
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
-        )
+        # Try sending as password reset (works for existing users)
+        response = supabase.auth.reset_password_email(request.email)
+        return {
+            "message": "New OTP code sent to your email!",
+            "email": request.email
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to resend verification: {str(e)}"
+            detail=f"Failed to resend OTP: {str(e)}"
         )
 
-# Token and session management
+@app.get("/auth/google/url")
+async def get_google_oauth_url():
+    """Get Google OAuth URL for frontend redirection"""
+    try:
+        response = supabase.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": f"{FRONTEND_URL}/auth/callback"
+            }
+        })
+        
+        return {
+            "url": response.url,
+            "message": "Redirect user to this URL for Google OAuth"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to generate Google OAuth URL: {str(e)}"
+        )
+
+@app.post("/auth/google/callback", response_model=AuthResponse)
+async def google_callback(access_token: str, refresh_token: str):
+    """Handle Google OAuth callback - frontend sends tokens after OAuth"""
+    try:
+        # Set the session with tokens received from frontend
+        response = supabase.auth.set_session(access_token, refresh_token)
+        
+        if response.user and response.session:
+            return AuthResponse(
+                access_token=response.session.access_token,
+                refresh_token=response.session.refresh_token,
+                user_id=response.user.id,
+                email=response.user.email,
+                message="Google authentication successful!"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Google OAuth tokens"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Google authentication failed: {str(e)}"
+        )
+
 @app.post("/auth/refresh")
 async def refresh_token(request: RefreshTokenRequest):
-    """Refresh access token"""
+    """Refresh access token using refresh token"""
     try:
         response = supabase.auth.refresh_session(request.refresh_token)
         
@@ -296,30 +282,39 @@ async def get_user_profile(current_user = Depends(get_current_user)):
     return {
         "user_id": current_user.id,
         "email": current_user.email,
-        "phone": current_user.phone,
-        "email_confirmed": current_user.email_confirmed_at is not None,
-        "phone_confirmed": current_user.phone_confirmed_at is not None,
         "created_at": current_user.created_at,
         "last_sign_in": current_user.last_sign_in_at
     }
+
+# NEW ENDPOINT: Get UID and JWT Token for database operations
+@app.get("/auth/token", response_model=TokenResponse)
+async def get_user_token(user_and_token = Depends(get_current_user_with_token)):
+    """Get user ID and JWT token for database operations"""
+    user, jwt_token = user_and_token
+    
+    return TokenResponse(
+        user_id=user.id,
+        jwt_token=jwt_token,
+        email=user.email,
+        message="Token and UID retrieved successfully"
+    )
 
 @app.get("/")
 async def root():
     """Health check endpoint"""
     return {
-        "message": "Supabase OTP-only Auth API is running",
+        "message": "Supabase OTP + Google Auth API is running!",
         "timestamp": datetime.now().isoformat(),
         "environment": ENVIRONMENT,
-        "auth_methods": ["email_otp", "sms_otp"]
+        "auth_methods": ["email_otp", "google_oauth"]
     }
 
 # Protected route example
 @app.get("/protected")
 async def protected_route(current_user = Depends(get_current_user)):
     """Example protected route"""
-    identifier = current_user.email or current_user.phone
     return {
-        "message": f"Hello {identifier}, this is a protected route!",
+        "message": f"Hello {current_user.email}, this is a protected route!",
         "user_id": current_user.id
     }
 
