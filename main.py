@@ -51,6 +51,14 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 PORT = int(os.getenv("PORT", 8000))
 
+# Test credentials configuration (only for development)
+TEST_EMAIL = "test@sobookey.in"
+TEST_OTP = "123456"
+TEST_PHONE = "+11234567890"
+
+# Test user session storage (in production, use a proper session store)
+test_sessions = {}
+
 # CORS configuration
 if ENVIRONMENT == "production":
     allowed_origins = [FRONTEND_URL]
@@ -90,9 +98,50 @@ def validate_phone_number(phone: str) -> str:
     
     return clean_phone
 
+def is_test_email(email: str) -> bool:
+    """Check if email is a test email"""
+    return ENVIRONMENT == "development" and email == TEST_EMAIL
+
+def is_test_phone(phone: str) -> bool:
+    """Check if phone is a test phone"""
+    try:
+        clean_phone = validate_phone_number(phone)
+        return ENVIRONMENT == "development" and clean_phone == TEST_PHONE
+    except:
+        return False
+
+def generate_test_token(identifier: str) -> str:
+    """Generate a simple test token for development"""
+    import uuid
+    token = f"test_token_{uuid.uuid4().hex[:16]}"
+    test_sessions[token] = {
+        "identifier": identifier,
+        "created_at": datetime.now().isoformat(),
+        "user_id": f"test_user_{identifier.replace('@', '_').replace('+', '_')}"
+    }
+    return token
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Extract and validate user from JWT token"""
     token = credentials.credentials
+    
+    # Check if it's a test token first
+    if ENVIRONMENT == "development" and token in test_sessions:
+        session_data = test_sessions[token]
+        # Create a mock user object
+        class MockUser:
+            def __init__(self, session_data):
+                self.id = session_data["user_id"]
+                self.email = session_data["identifier"] if "@" in session_data["identifier"] else None
+                self.phone = session_data["identifier"] if "+" in session_data["identifier"] else None
+                self.email_confirmed_at = datetime.now().isoformat() if self.email else None
+                self.phone_confirmed_at = datetime.now().isoformat() if self.phone else None
+                self.created_at = session_data["created_at"]
+                self.last_sign_in_at = datetime.now().isoformat()
+        
+        return MockUser(session_data)
+    
+    # Otherwise, use Supabase validation
     try:
         response = supabase.auth.get_user(token)
         if response.user:
@@ -143,13 +192,24 @@ async def root():
     try:
         # Test basic Supabase connection
         # This doesn't make an actual API call but ensures the client is working
-        return {
+        response_data = {
             "message": "Supabase OTP-only Auth API is running",
             "timestamp": datetime.now().isoformat(),
             "environment": ENVIRONMENT,
             "auth_methods": ["email_otp", "sms_otp"],
             "status": "healthy"
         }
+        
+        # Add test credentials info in development
+        if ENVIRONMENT == "development":
+            response_data["test_mode"] = True
+            response_data["test_credentials"] = {
+                "email": TEST_EMAIL,
+                "phone": TEST_PHONE,
+                "otp": TEST_OTP
+            }
+        
+        return response_data
     except Exception as e:
         return {
             "message": "API running but Supabase connection issues",
@@ -161,6 +221,16 @@ async def root():
 async def email_sign_in(request: EmailSignInRequest):
     """Sign in with email (sends email OTP)"""
     try:
+        # Handle test email
+        if is_test_email(request.email):
+            print(f"Test email signin: {request.email}")
+            return AuthResponse(
+                message=f"[TEST MODE] Email verification code sent. Use OTP: {TEST_OTP}",
+                requires_verification=True,
+                email=request.email
+            )
+        
+        # Regular Supabase flow
         response = supabase.auth.sign_in_with_otp({
             "email": request.email
         })
@@ -184,6 +254,16 @@ async def phone_sign_in(request: PhoneSignInRequest):
     try:
         clean_phone = validate_phone_number(request.phone)
         
+        # Handle test phone
+        if is_test_phone(clean_phone):
+            print(f"Test phone signin: {clean_phone}")
+            return AuthResponse(
+                message=f"[TEST MODE] SMS verification code sent. Use OTP: {TEST_OTP}",
+                requires_verification=True,
+                phone=clean_phone
+            )
+        
+        # Regular Supabase flow
         response = supabase.auth.sign_in_with_otp({
             "phone": clean_phone
         })
@@ -210,6 +290,47 @@ async def phone_sign_in(request: PhoneSignInRequest):
 async def verify_otp(request: VerifyOTPRequest):
     """Verify OTP code (email or SMS)"""
     try:
+        # Handle test credentials
+        if request.email and is_test_email(request.email):
+            if request.token == TEST_OTP:
+                test_token = generate_test_token(request.email)
+                print(f"Test email OTP verified for: {request.email}")
+                return AuthResponse(
+                    access_token=test_token,
+                    refresh_token=f"refresh_{test_token}",
+                    user_id=f"test_user_{request.email.replace('@', '_')}",
+                    email=request.email,
+                    phone=None,
+                    message="[TEST MODE] Verification successful!",
+                    requires_verification=False
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid OTP. For test email, use: {TEST_OTP}"
+                )
+        
+        if request.phone and is_test_phone(request.phone):
+            if request.token == TEST_OTP:
+                clean_phone = validate_phone_number(request.phone)
+                test_token = generate_test_token(clean_phone)
+                print(f"Test phone OTP verified for: {clean_phone}")
+                return AuthResponse(
+                    access_token=test_token,
+                    refresh_token=f"refresh_{test_token}",
+                    user_id=f"test_user_{clean_phone.replace('+', '_')}",
+                    email=None,
+                    phone=clean_phone,
+                    message="[TEST MODE] Verification successful!",
+                    requires_verification=False
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid OTP. For test phone, use: {TEST_OTP}"
+                )
+        
+        # Regular Supabase flow
         if request.email:
             response = supabase.auth.verify_otp({
                 "email": request.email,
@@ -262,12 +383,21 @@ async def resend_otp(request: ResendOTPRequest):
     """Resend OTP verification (email or SMS)"""
     try:
         if request.email:
+            # Handle test email
+            if is_test_email(request.email):
+                return {"message": f"[TEST MODE] Email verification code sent. Use OTP: {TEST_OTP}"}
+            
             response = supabase.auth.sign_in_with_otp({
                 "email": request.email
             })
             return {"message": "Email verification code sent successfully"}
         elif request.phone:
             clean_phone = validate_phone_number(request.phone)
+            
+            # Handle test phone
+            if is_test_phone(clean_phone):
+                return {"message": f"[TEST MODE] SMS verification code sent. Use OTP: {TEST_OTP}"}
+            
             response = supabase.auth.sign_in_with_otp({
                 "phone": clean_phone
             })
@@ -294,6 +424,19 @@ async def resend_otp(request: ResendOTPRequest):
 async def refresh_token(request: RefreshTokenRequest):
     """Refresh access token"""
     try:
+        # Handle test tokens
+        if ENVIRONMENT == "development" and request.refresh_token.startswith("refresh_test_token_"):
+            original_token = request.refresh_token.replace("refresh_", "")
+            if original_token in test_sessions:
+                session_data = test_sessions[original_token]
+                new_token = generate_test_token(session_data["identifier"])
+                return {
+                    "access_token": new_token,
+                    "refresh_token": f"refresh_{new_token}",
+                    "message": "[TEST MODE] Token refreshed successfully"
+                }
+        
+        # Regular Supabase flow
         response = supabase.auth.refresh_session(request.refresh_token)
         
         if response.session:
@@ -319,6 +462,20 @@ async def refresh_token(request: RefreshTokenRequest):
 async def sign_out(current_user = Depends(get_current_user)):
     """Sign out current user"""
     try:
+        # For test users, just remove from test_sessions
+        if ENVIRONMENT == "development" and hasattr(current_user, 'id') and current_user.id.startswith('test_user_'):
+            # Find and remove test tokens
+            tokens_to_remove = []
+            for token, session_data in test_sessions.items():
+                if session_data["user_id"] == current_user.id:
+                    tokens_to_remove.append(token)
+            
+            for token in tokens_to_remove:
+                del test_sessions[token]
+            
+            return {"message": "[TEST MODE] Signed out successfully"}
+        
+        # Regular Supabase flow
         response = supabase.auth.sign_out()
         return {"message": "Signed out successfully"}
     except Exception as e:
@@ -339,19 +496,30 @@ async def get_user_profile(current_user = Depends(get_current_user)):
         "email_confirmed": current_user.email_confirmed_at is not None,
         "phone_confirmed": current_user.phone_confirmed_at is not None,
         "created_at": current_user.created_at,
-        "last_sign_in": current_user.last_sign_in_at
+        "last_sign_in": current_user.last_sign_in_at,
+        "is_test_user": ENVIRONMENT == "development" and current_user.id.startswith('test_user_')
     }
 
 @app.get("/protected")
 async def protected_route(current_user = Depends(get_current_user)):
     """Example protected route"""
     identifier = current_user.email or current_user.phone
+    is_test = ENVIRONMENT == "development" and current_user.id.startswith('test_user_')
+    test_prefix = "[TEST MODE] " if is_test else ""
+    
     return {
-        "message": f"Hello {identifier}, this is a protected route!",
-        "user_id": current_user.id
+        "message": f"{test_prefix}Hello {identifier}, this is a protected route!",
+        "user_id": current_user.id,
+        "is_test_user": is_test
     }
 
 if __name__ == "__main__":
     import uvicorn
     print(f"Starting server on port {PORT}")
+    print(f"Environment: {ENVIRONMENT}")
+    if ENVIRONMENT == "development":
+        print(f"Test credentials available:")
+        print(f"  Email: {TEST_EMAIL}")
+        print(f"  Phone: {TEST_PHONE}")
+        print(f"  OTP: {TEST_OTP}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
