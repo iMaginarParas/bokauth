@@ -44,7 +44,7 @@ except Exception as e:
     sys.exit(1)
 
 # Initialize FastAPI app
-app = FastAPI(title="Supabase OTP Auth API", version="1.0.0")
+app = FastAPI(title="Supabase Multi-Auth API", version="1.0.0")
 
 # Environment configuration
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
@@ -176,6 +176,14 @@ class ResendOTPRequest(BaseModel):
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
+class EmailPasswordRegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class EmailPasswordLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
 class AuthResponse(BaseModel):
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
@@ -193,10 +201,10 @@ async def root():
         # Test basic Supabase connection
         # This doesn't make an actual API call but ensures the client is working
         response_data = {
-            "message": "Supabase OTP-only Auth API is running",
+            "message": "Supabase Multi-Auth API is running",
             "timestamp": datetime.now().isoformat(),
             "environment": ENVIRONMENT,
-            "auth_methods": ["email_otp", "sms_otp"],
+            "auth_methods": ["email_otp", "sms_otp", "email_password"],
             "status": "healthy"
         }
         
@@ -206,7 +214,8 @@ async def root():
             response_data["test_credentials"] = {
                 "email": TEST_EMAIL,
                 "phone": TEST_PHONE,
-                "otp": TEST_OTP
+                "otp": TEST_OTP,
+                "password": "Any password works for test email in development mode"
             }
         
         return response_data
@@ -500,6 +509,127 @@ async def get_user_profile(current_user = Depends(get_current_user)):
         "is_test_user": ENVIRONMENT == "development" and current_user.id.startswith('test_user_')
     }
 
+@app.post("/auth/register", response_model=AuthResponse)
+async def register_with_password(request: EmailPasswordRegisterRequest):
+    """Register new user with email and password"""
+    try:
+        # Handle test email in development
+        if ENVIRONMENT == "development" and request.email == TEST_EMAIL:
+            # For test mode, create a simple mock registration
+            test_token = generate_test_token(request.email)
+            return AuthResponse(
+                access_token=test_token,
+                refresh_token=f"refresh_{test_token}",
+                user_id=f"test_user_{request.email.replace('@', '_').replace('.', '_')}",
+                email=request.email,
+                phone=None,
+                message="[TEST MODE] Registration successful!",
+                requires_verification=False
+            )
+        
+        # Regular Supabase registration
+        response = supabase.auth.sign_up({
+            "email": request.email,
+            "password": request.password
+        })
+        
+        if response.user and response.session:
+            return AuthResponse(
+                access_token=response.session.access_token,
+                refresh_token=response.session.refresh_token,
+                user_id=response.user.id,
+                email=response.user.email,
+                phone=None,
+                message="Registration successful!",
+                requires_verification=not response.user.email_confirmed_at
+            )
+        elif response.user:
+            # User created but needs email confirmation
+            return AuthResponse(
+                access_token=None,
+                refresh_token=None,
+                user_id=response.user.id,
+                email=response.user.email,
+                phone=None,
+                message="Registration successful! Please check your email for confirmation.",
+                requires_verification=True
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Registration failed"
+            )
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Registration error: {error_msg}")
+        
+        # Handle common Supabase errors
+        if "already registered" in error_msg.lower() or "already exists" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Registration failed: {error_msg}"
+        )
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login_with_password(request: EmailPasswordLoginRequest):
+    """Login user with email and password"""
+    try:
+        # Handle test email in development
+        if ENVIRONMENT == "development" and request.email == TEST_EMAIL:
+            # For test mode, accept any password
+            test_token = generate_test_token(request.email)
+            return AuthResponse(
+                access_token=test_token,
+                refresh_token=f"refresh_{test_token}",
+                user_id=f"test_user_{request.email.replace('@', '_').replace('.', '_')}",
+                email=request.email,
+                phone=None,
+                message="[TEST MODE] Login successful!",
+                requires_verification=False
+            )
+        
+        # Regular Supabase login
+        response = supabase.auth.sign_in_with_password({
+            "email": request.email,
+            "password": request.password
+        })
+        
+        if response.user and response.session:
+            return AuthResponse(
+                access_token=response.session.access_token,
+                refresh_token=response.session.refresh_token,
+                user_id=response.user.id,
+                email=response.user.email,
+                phone=response.user.phone,
+                message="Login successful!",
+                requires_verification=False
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Login error: {error_msg}")
+        
+        # Handle common authentication errors
+        if "invalid" in error_msg.lower() or "credentials" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+        
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Login failed: {error_msg}"
+        )
+
 @app.get("/protected")
 async def protected_route(current_user = Depends(get_current_user)):
     """Example protected route"""
@@ -517,9 +647,11 @@ if __name__ == "__main__":
     import uvicorn
     print(f"Starting server on port {PORT}")
     print(f"Environment: {ENVIRONMENT}")
+    print("Available authentication methods: Email OTP, SMS OTP, Email/Password")
     if ENVIRONMENT == "development":
         print(f"Test credentials available:")
         print(f"  Email: {TEST_EMAIL}")
         print(f"  Phone: {TEST_PHONE}")
         print(f"  OTP: {TEST_OTP}")
+        print(f"  Password: Any password works for test email")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
