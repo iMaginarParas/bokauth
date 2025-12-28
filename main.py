@@ -160,6 +160,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # Pydantic models
 class EmailSignInRequest(BaseModel):
     email: EmailStr
+    name: Optional[str] = None
 
 class PhoneSignInRequest(BaseModel):
     phone: str
@@ -237,20 +238,34 @@ async def sign_in_with_email(request: EmailSignInRequest):
     try:
         # Handle test email in development mode
         if is_test_email(request.email):
+            message = f"[TEST MODE] OTP sent to {request.email}. Use OTP: {TEST_OTP}"
+            if request.name:
+                message += f" Name: {request.name}"
+            
             return AuthResponse(
                 access_token=None,
                 refresh_token=None,
                 user_id=None,
                 email=request.email,
                 phone=None,
-                message=f"[TEST MODE] OTP sent to {request.email}. Use OTP: {TEST_OTP}",
+                message=message,
                 requires_verification=True
             )
         
         # Use Supabase's signInWithOtp for real emails
-        response = supabase.auth.sign_in_with_otp({
+        otp_data = {
             "email": request.email
-        })
+        }
+        
+        # Add name to user metadata if provided
+        if request.name:
+            otp_data["options"] = {
+                "data": {
+                    "name": request.name
+                }
+            }
+        
+        response = supabase.auth.sign_in_with_otp(otp_data)
         
         return AuthResponse(
             access_token=None,
