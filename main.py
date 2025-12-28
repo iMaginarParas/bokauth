@@ -180,6 +180,7 @@ class RefreshTokenRequest(BaseModel):
 class EmailPasswordRegisterRequest(BaseModel):
     email: EmailStr
     password: str
+    name: Optional[str] = None
 
 class EmailPasswordLoginRequest(BaseModel):
     email: EmailStr
@@ -219,321 +220,309 @@ async def root():
                 "email": TEST_EMAIL,
                 "phone": TEST_PHONE,
                 "otp": TEST_OTP,
-                "password": "Any password works for test email in development mode"
+                "note": "Use these credentials for testing without sending real OTPs"
             }
         
         return response_data
     except Exception as e:
         return {
-            "message": "API running but Supabase connection issues",
+            "message": "API is running but there might be configuration issues",
             "error": str(e),
             "status": "degraded"
         }
 
-@app.post("/auth/email/signin", response_model=AuthResponse)
-async def email_sign_in(request: EmailSignInRequest):
-    """Sign in with email (sends email OTP)"""
+@app.post("/auth/signin/email", response_model=AuthResponse)
+async def sign_in_with_email(request: EmailSignInRequest):
+    """Send OTP to email for passwordless sign-in"""
     try:
-        # Handle test email
+        # Handle test email in development mode
         if is_test_email(request.email):
-            print(f"Test email signin: {request.email}")
             return AuthResponse(
-                message=f"[TEST MODE] Email verification code sent. Use OTP: {TEST_OTP}",
-                requires_verification=True,
-                email=request.email
+                access_token=None,
+                refresh_token=None,
+                user_id=None,
+                email=request.email,
+                phone=None,
+                message=f"[TEST MODE] OTP sent to {request.email}. Use OTP: {TEST_OTP}",
+                requires_verification=True
             )
         
-        # Regular Supabase flow
+        # Use Supabase's signInWithOtp for real emails
         response = supabase.auth.sign_in_with_otp({
             "email": request.email
         })
         
         return AuthResponse(
-            message="Email verification code sent. Please check your email.",
-            requires_verification=True,
-            email=request.email
+            access_token=None,
+            refresh_token=None,
+            user_id=None,
+            email=request.email,
+            phone=None,
+            message="OTP sent to your email. Please check your inbox.",
+            requires_verification=True
         )
     except Exception as e:
         error_msg = str(e)
-        print(f"Email sign in error: {error_msg}")
+        print(f"Email sign-in error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to send email OTP: {error_msg}"
+            detail=f"Failed to send OTP: {error_msg}"
         )
 
-@app.post("/auth/phone/signin", response_model=AuthResponse)
-async def phone_sign_in(request: PhoneSignInRequest):
-    """Sign in with phone number (sends SMS OTP)"""
+@app.post("/auth/signin/phone", response_model=AuthResponse)
+async def sign_in_with_phone(request: PhoneSignInRequest):
+    """Send OTP to phone for passwordless sign-in"""
     try:
+        # Validate and format phone number
         clean_phone = validate_phone_number(request.phone)
         
-        # Handle test phone
+        # Handle test phone in development mode
         if is_test_phone(clean_phone):
-            print(f"Test phone signin: {clean_phone}")
             return AuthResponse(
-                message=f"[TEST MODE] SMS verification code sent. Use OTP: {TEST_OTP}",
-                requires_verification=True,
-                phone=clean_phone
+                access_token=None,
+                refresh_token=None,
+                user_id=None,
+                email=None,
+                phone=clean_phone,
+                message=f"[TEST MODE] OTP sent to {clean_phone}. Use OTP: {TEST_OTP}",
+                requires_verification=True
             )
         
-        # Regular Supabase flow
+        # Use Supabase's signInWithOtp for real phone numbers
         response = supabase.auth.sign_in_with_otp({
             "phone": clean_phone
         })
         
         return AuthResponse(
-            message="SMS verification code sent. Please check your phone.",
-            requires_verification=True,
-            phone=clean_phone
+            access_token=None,
+            refresh_token=None,
+            user_id=None,
+            email=None,
+            phone=clean_phone,
+            message="OTP sent to your phone. Please check your messages.",
+            requires_verification=True
         )
-    except ValueError as ve:
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
+            detail=str(e)
         )
     except Exception as e:
         error_msg = str(e)
-        print(f"Phone sign in error: {error_msg}")
+        print(f"Phone sign-in error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to send SMS OTP: {error_msg}"
+            detail=f"Failed to send OTP: {error_msg}"
         )
 
-@app.post("/auth/verify-otp", response_model=AuthResponse)
+@app.post("/auth/verify", response_model=AuthResponse)
 async def verify_otp(request: VerifyOTPRequest):
-    """Verify OTP code (email or SMS) OR authenticate with email/password"""
+    """Verify OTP for email or phone"""
     try:
-        # Validate input - must provide either token OR password, not both or neither
+        # Validate that either email or phone is provided
+        if not request.email and not request.phone:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either email or phone must be provided"
+            )
+        
+        # Validate that either token (OTP) or password is provided
         if not request.token and not request.password:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either 'token' (for OTP) or 'password' (for email/password auth) is required"
+                detail="Either OTP token or password must be provided"
             )
         
-        if request.token and request.password:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Provide either 'token' OR 'password', not both"
-            )
-        
-        # PASSWORD AUTHENTICATION PATH
-        if request.password and request.email:
-            # Handle test email in development
-            if ENVIRONMENT == "development" and request.email == TEST_EMAIL:
-                # For test mode, accept any password
-                test_token = generate_test_token(request.email)
-                return AuthResponse(
-                    access_token=test_token,
-                    refresh_token=f"refresh_{test_token}",
-                    user_id=f"test_user_{request.email.replace('@', '_').replace('.', '_')}",
-                    email=request.email,
-                    phone=None,
-                    message="[TEST MODE] Password login successful!",
-                    requires_verification=False
-                )
-            
-            # Regular Supabase password authentication
-            response = supabase.auth.sign_in_with_password({
-                "email": request.email,
-                "password": request.password
-            })
-            
-            if response.user and response.session:
-                return AuthResponse(
-                    access_token=response.session.access_token,
-                    refresh_token=response.session.refresh_token,
-                    user_id=response.user.id,
-                    email=response.user.email,
-                    phone=response.user.phone,
-                    message="Password login successful!",
-                    requires_verification=False
-                )
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid email or password"
-                )
-        
-        elif request.password and not request.email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email is required when using password authentication"
-            )
-        
-        # OTP VERIFICATION PATH (existing logic)
-        elif request.token:
-            # Handle test credentials
+        # Handle test credentials in development mode
+        if ENVIRONMENT == "development":
+            # Test email verification
             if request.email and is_test_email(request.email):
-                if request.token == TEST_OTP:
+                if request.token == TEST_OTP or request.password:  # Accept test OTP or any password
                     test_token = generate_test_token(request.email)
-                    print(f"Test email OTP verified for: {request.email}")
                     return AuthResponse(
                         access_token=test_token,
                         refresh_token=f"refresh_{test_token}",
-                        user_id=f"test_user_{request.email.replace('@', '_')}",
+                        user_id=f"test_user_{request.email.replace('@', '_').replace('.', '_')}",
                         email=request.email,
                         phone=None,
-                        message="[TEST MODE] OTP verification successful!",
+                        message="[TEST MODE] Verification successful!",
                         requires_verification=False
                     )
                 else:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Invalid OTP. For test email, use: {TEST_OTP}"
+                        detail=f"[TEST MODE] Invalid OTP. Use: {TEST_OTP}"
                     )
             
-            if request.phone and is_test_phone(request.phone):
-                if request.token == TEST_OTP:
-                    clean_phone = validate_phone_number(request.phone)
-                    test_token = generate_test_token(clean_phone)
-                    print(f"Test phone OTP verified for: {clean_phone}")
-                    return AuthResponse(
-                        access_token=test_token,
-                        refresh_token=f"refresh_{test_token}",
-                        user_id=f"test_user_{clean_phone.replace('+', '_')}",
-                        email=None,
-                        phone=clean_phone,
-                        message="[TEST MODE] OTP verification successful!",
-                        requires_verification=False
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Invalid OTP. For test phone, use: {TEST_OTP}"
-                    )
+            # Test phone verification
+            if request.phone:
+                clean_phone = validate_phone_number(request.phone)
+                if is_test_phone(clean_phone):
+                    if request.token == TEST_OTP:
+                        test_token = generate_test_token(clean_phone)
+                        return AuthResponse(
+                            access_token=test_token,
+                            refresh_token=f"refresh_{test_token}",
+                            user_id=f"test_user_{clean_phone.replace('+', '_')}",
+                            email=None,
+                            phone=clean_phone,
+                            message="[TEST MODE] Verification successful!",
+                            requires_verification=False
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"[TEST MODE] Invalid OTP. Use: {TEST_OTP}"
+                        )
+        
+        # Real OTP verification using Supabase
+        if request.token:  # OTP verification
+            verification_data = {
+                "token": request.token,
+                "type": "sms" if request.phone else "email"
+            }
             
-            # Regular Supabase OTP verification
             if request.email:
-                response = supabase.auth.verify_otp({
-                    "email": request.email,
-                    "token": request.token,
-                    "type": "email"
-                })
+                verification_data["email"] = request.email
             elif request.phone:
                 clean_phone = validate_phone_number(request.phone)
-                response = supabase.auth.verify_otp({
-                    "phone": clean_phone,
-                    "token": request.token,
-                    "type": "sms"
+                verification_data["phone"] = clean_phone
+            
+            response = supabase.auth.verify_otp(verification_data)
+        else:  # Password verification
+            if request.email:
+                response = supabase.auth.sign_in_with_password({
+                    "email": request.email,
+                    "password": request.password
                 })
             else:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Either email or phone number is required for OTP verification"
+                    detail="Password authentication only supported for email"
                 )
+        
+        # Check if we got a valid session
+        if response.user and response.session:
+            return AuthResponse(
+                access_token=response.session.access_token,
+                refresh_token=response.session.refresh_token,
+                user_id=response.user.id,
+                email=response.user.email,
+                phone=response.user.phone,
+                message="Verification successful!",
+                requires_verification=False
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Verification failed"
+            )
             
-            if response.user and response.session:
-                return AuthResponse(
-                    access_token=response.session.access_token,
-                    refresh_token=response.session.refresh_token,
-                    user_id=response.user.id,
-                    email=response.user.email,
-                    phone=response.user.phone,
-                    message="OTP verification successful!",
-                    requires_verification=False
-                )
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid or expired verification code"
-                )
-                
-    except ValueError as ve:
+    except HTTPException:
+        raise
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
+            detail=str(e)
         )
-    except HTTPException:
-        # Re-raise HTTPExceptions as-is
-        raise
     except Exception as e:
         error_msg = str(e)
         print(f"Verification error: {error_msg}")
         
-        # Handle common authentication errors for password login
-        if "invalid" in error_msg.lower() or "credentials" in error_msg.lower():
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        elif "email not confirmed" in error_msg.lower():
+        # Handle specific Supabase errors
+        if "invalid" in error_msg.lower() or "expired" in error_msg.lower():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Please verify your email address before logging in. Check your inbox for confirmation email."
+                detail="Invalid or expired OTP"
             )
         
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Authentication failed: {error_msg}"
+            detail=f"Verification failed: {error_msg}"
         )
 
-@app.post("/auth/resend-otp")
+@app.post("/auth/resend")
 async def resend_otp(request: ResendOTPRequest):
-    """Resend OTP verification (email or SMS)"""
+    """Resend OTP to email or phone"""
     try:
-        if request.email:
-            # Handle test email
-            if is_test_email(request.email):
-                return {"message": f"[TEST MODE] Email verification code sent. Use OTP: {TEST_OTP}"}
-            
-            response = supabase.auth.sign_in_with_otp({
-                "email": request.email
-            })
-            return {"message": "Email verification code sent successfully"}
-        elif request.phone:
-            clean_phone = validate_phone_number(request.phone)
-            
-            # Handle test phone
-            if is_test_phone(clean_phone):
-                return {"message": f"[TEST MODE] SMS verification code sent. Use OTP: {TEST_OTP}"}
-            
-            response = supabase.auth.sign_in_with_otp({
-                "phone": clean_phone
-            })
-            return {"message": "SMS verification code sent successfully"}
-        else:
+        if not request.email and not request.phone:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either email or phone number is required"
+                detail="Either email or phone must be provided"
             )
-    except ValueError as ve:
+        
+        # Handle test credentials
+        if request.email and is_test_email(request.email):
+            return {"message": f"[TEST MODE] OTP resent to {request.email}. Use OTP: {TEST_OTP}"}
+        
+        if request.phone:
+            clean_phone = validate_phone_number(request.phone)
+            if is_test_phone(clean_phone):
+                return {"message": f"[TEST MODE] OTP resent to {clean_phone}. Use OTP: {TEST_OTP}"}
+        
+        # Resend using Supabase
+        resend_data = {
+            "type": "sms" if request.phone else "signup"
+        }
+        
+        if request.email:
+            resend_data["email"] = request.email
+        elif request.phone:
+            clean_phone = validate_phone_number(request.phone)
+            resend_data["phone"] = clean_phone
+        
+        response = supabase.auth.resend(resend_data)
+        
+        return {"message": "OTP resent successfully"}
+        
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
+            detail=str(e)
         )
     except Exception as e:
         error_msg = str(e)
         print(f"Resend OTP error: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to resend verification: {error_msg}"
+            detail=f"Failed to resend OTP: {error_msg}"
         )
 
-@app.post("/auth/refresh")
+@app.post("/auth/refresh", response_model=AuthResponse)
 async def refresh_token(request: RefreshTokenRequest):
-    """Refresh access token"""
+    """Refresh access token using refresh token"""
     try:
         # Handle test tokens
         if ENVIRONMENT == "development" and request.refresh_token.startswith("refresh_test_token_"):
             original_token = request.refresh_token.replace("refresh_", "")
             if original_token in test_sessions:
+                # Generate new test token
                 session_data = test_sessions[original_token]
                 new_token = generate_test_token(session_data["identifier"])
-                return {
-                    "access_token": new_token,
-                    "refresh_token": f"refresh_{new_token}",
-                    "message": "[TEST MODE] Token refreshed successfully"
-                }
+                
+                return AuthResponse(
+                    access_token=new_token,
+                    refresh_token=f"refresh_{new_token}",
+                    user_id=session_data["user_id"],
+                    email=session_data["identifier"] if "@" in session_data["identifier"] else None,
+                    phone=session_data["identifier"] if "+" in session_data["identifier"] else None,
+                    message="[TEST MODE] Token refreshed successfully",
+                    requires_verification=False
+                )
         
-        # Regular Supabase flow
+        # Use Supabase's refresh token
         response = supabase.auth.refresh_session(request.refresh_token)
         
-        if response.session:
-            return {
-                "access_token": response.session.access_token,
-                "refresh_token": response.session.refresh_token,
-                "message": "Token refreshed successfully"
-            }
+        if response.session and response.user:
+            return AuthResponse(
+                access_token=response.session.access_token,
+                refresh_token=response.session.refresh_token,
+                user_id=response.user.id,
+                email=response.user.email,
+                phone=response.user.phone,
+                message="Token refreshed successfully",
+                requires_verification=False
+            )
         else:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -578,10 +567,13 @@ async def sign_out(current_user = Depends(get_current_user)):
 @app.get("/auth/user")
 async def get_user_profile(current_user = Depends(get_current_user)):
     """Get current user profile"""
+    user_metadata = getattr(current_user, 'user_metadata', {}) or {}
+    
     return {
         "user_id": current_user.id,
         "email": current_user.email,
         "phone": current_user.phone,
+        "name": user_metadata.get('name'),
         "email_confirmed": current_user.email_confirmed_at is not None,
         "phone_confirmed": current_user.phone_confirmed_at is not None,
         "created_at": current_user.created_at,
@@ -597,21 +589,35 @@ async def register_with_password(request: EmailPasswordRegisterRequest):
         if ENVIRONMENT == "development" and request.email == TEST_EMAIL:
             # For test mode, create a simple mock registration
             test_token = generate_test_token(request.email)
+            message = "[TEST MODE] Registration successful!"
+            if request.name:
+                message += f" Name: {request.name}"
+            
             return AuthResponse(
                 access_token=test_token,
                 refresh_token=f"refresh_{test_token}",
                 user_id=f"test_user_{request.email.replace('@', '_').replace('.', '_')}",
                 email=request.email,
                 phone=None,
-                message="[TEST MODE] Registration successful!",
+                message=message,
                 requires_verification=False
             )
         
         # Regular Supabase registration
-        response = supabase.auth.sign_up({
+        signup_data = {
             "email": request.email,
             "password": request.password
-        })
+        }
+        
+        # Only add name to metadata if provided
+        if request.name:
+            signup_data["options"] = {
+                "data": {
+                    "name": request.name
+                }
+            }
+        
+        response = supabase.auth.sign_up(signup_data)
         
         if response.user and response.session:
             return AuthResponse(
