@@ -54,7 +54,7 @@ PORT = int(os.getenv("PORT", 8000))
 # Test credentials configuration (only for development)
 TEST_EMAIL = "test@sobookey.in"
 TEST_OTP = "123456"
-TEST_PHONE = "+11234567890"
+TEST_PHONE = "+919999999999"
 
 # Test user session storage (in production, use a proper session store)
 test_sessions = {}
@@ -85,16 +85,17 @@ def validate_phone_number(phone: str) -> str:
     # Remove all non-digit characters except +
     clean_phone = re.sub(r'[^\d+]', '', phone)
     
-    # Ensure phone number starts with country code
+    # Ensure phone number starts with + and a country code
     if not clean_phone.startswith('+'):
-        if clean_phone.startswith('0'):
-            clean_phone = clean_phone[1:]
-        # Add default country code for US
-        clean_phone = '+1' + clean_phone
+        raise ValueError(
+            "Phone number must include country code (e.g. +919876543210 for India, +12025550123 for US)"
+        )
     
-    # Validate phone number format
-    if not re.match(r'^\+\d{10,15}$', clean_phone):
-        raise ValueError("Invalid phone number format. Use format: +1234567890")
+    # Validate phone number format: + followed by 7–15 digits
+    if not re.match(r'^\+\d{7,15}$', clean_phone):
+        raise ValueError(
+            "Invalid phone number format. Use E.164 format: +<country_code><number> (e.g. +919876543210)"
+        )
     
     return clean_phone
 
